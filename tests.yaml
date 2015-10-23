@@ -1,18 +1,37 @@
+#---
+#type: 'group'
+#id: 1
+#buckets: [
+#    { actions: [ {output: 1} ] }
+#    ]
+#group_type: 'select'
+#---
+#type: 'group'
+#id: 2
+#buckets: [
+#    { actions: [ {output: 1} ] }
+#    ]
+#group_type: 'select'
+#---
+#type: 'group'
+#id: 3
+#buckets: [
+#    { actions: [ {group: 1} ] },
+#    { actions: [ {group: 2} ] }
+#    ]
+#group_type: 'all'
 ---
-group: 1
-buckets: [
-    { actions: [ {output: 1} ] }
-    ]
-type: 'indirect'
----
-group: 2
-buckets: [
-    { actions: [ {output: 1} ] }
-    ]
-type: 'indirect'
----
+type: 'flow'
 match: {in_port: 1}
-apply_actions: [ {group: 2} ]
+apply_actions: [ {push_vlan: 22}, {output: 2}, {output: 3} ]
 ---
-match: {in_port: 2}
-apply_actions: [ {group: 1} ]
+type: 'outcome'
+match: {in_port: 2, vlan_vid: 22}
+cookie: 1
+---
+type: 'outcome'
+match: {in_port: 3, vlan_vid: 22}
+cookie: 2
+---
+type: 'test'
+match: {in_port: 1}

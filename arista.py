@@ -16,7 +16,7 @@
 # limitations under the License.
 
 import os, signal, logging
-import time, json, yaml
+import time, json, yaml, array, threading
 
 from ryu.base import app_manager
 from ryu.controller import ofp_event
@@ -30,6 +30,8 @@ from ryu.lib import ofctl_v1_3
 from ryu.lib.packet import packet
 from ryu.lib.packet import ethernet
 from ryu.lib.packet import vlan
+from ryu.lib.packet import ipv4
+from ryu.lib.packet import tcp
 
 # some default values
 vid = 2040
@@ -54,52 +56,20 @@ action_2 = parser.OFPActionOutput(2)
 action_3 = parser.OFPActionOutput(3)
 action_controller = parser.OFPActionOutput(ofp.OFPP_CONTROLLER)
 
-class Faucet(app_manager.RyuApp):
-    """A Ryu app that performs layer 2 switching with VLANs.
-
-    The intelligence is largely provided by a Valve class. Faucet's role is
-    mainly to perform set up and to provide a communication layer between ryu
-    and valve.
-    """
+class SwitchTester(app_manager.RyuApp):
     OFP_VERSIONS = [ofp.OFP_VERSION]
 
     _CONTEXTS = {'dpset': dpset.DPSet}
 
-    logname = 'faucet'
-    exc_logname = logname + '.exception'
-
     def __init__(self, *args, **kwargs):
-        super(Faucet, self).__init__(*args, **kwargs)
-
-    def get_group_id(self, vlan_vid, port=None):
-        if port is None:
-            # no port indicates this is a flood group
-            return  (4 << 28) | (vlan_vid << 16)
-        else:
-            return  (vlan_vid << 16) | port
-
-    def send_flow_mod(self, dp, mod):
-        jsondict = mod.to_jsondict()
-        print json.dumps(jsondict, indent=4)
-        dp.send_msg(mod)
-
+        super(SwitchTester, self).__init__(*args, **kwargs)
+        self.outcomes = {}
+        self.ovs_dp = None
+        self.dut_dp = None
 
     def print_mod(self, mod):
         jsondict = mod.to_jsondict()
         print json.dumps(jsondict, indent=4)
-
-    def send_group_mod(self, dp, mod):
-        jsondict = mod.to_jsondict()
-        print json.dumps(jsondict, indent=4)
-        dp.send_msg(mod)
-
-        match = parser.OFPMatch()
-        req = parser.OFPFlowStatsRequest(
-            dp, 0, ofp.OFPTT_ALL, ofp.OFPP_ANY, ofp.OFPG_ANY, 0, 0, match)
-        dp.send_msg(req)
-        print ""
-        time.sleep(3)
-        print "==========================================="
 
     @set_ev_cls(ofp_event.EventOFPFlowStatsReply, MAIN_DISPATCHER)
     def flow_stats_reply_handler(self, ev):
@@ -113,25 +83,32 @@ class Faucet(app_manager.RyuApp):
         print "group stats reply:"
         print json.dumps(jsondict, indent=4)
 
-
     @set_ev_cls(ofp_event.EventOFPPacketIn, MAIN_DISPATCHER)
     def _packet_in_handler(self, ev):
+        print "packet in {0}".format(ev.msg.datapath.id)
         jsondict = ev.msg.to_jsondict()
         print json.dumps(jsondict, indent=4)
+
+        pkt = packet.Packet(array.array('B', ev.msg.data))
+        self.print_packet(pkt)
+        if ev.msg.cookie in self.outcomes:
+            self.outcomes[ev.msg.cookie] = True
+        else:
+            self.outcomes[999] = False
+            print "received unexpected packet"
+
+    def print_packet(self, pkt):
+        for p in pkt.protocols:
+            print p
 
     @set_ev_cls(dpset.EventDP, dpset.DPSET_EV_DISPATCHER)
     def handler_datapath(self, ev):
         dp = ev.dp
-
-        if not ev.enter:
-            # Datapath down message
-            self.valve.datapath_disconnect(dp.id)
-            returnall
+        print "new datapath!"
 
         # Delete things
         mod = parser.OFPFlowMod(
             datapath=dp,
-            cookie=cookie,
             command=ofp.OFPFC_DELETE,
             out_port=ofp.OFPP_ANY,
             out_group=ofp.OFPG_ANY,
@@ -140,29 +117,131 @@ class Faucet(app_manager.RyuApp):
         dp.send_msg(mod)
         self.print_mod(mod)
 
+        if dp.id == 17:
+            self.ovs_dp = dp
+        else:
+            self.dut_dp = dp
+
+        if self.ovs_dp is not None and self.dut_dp is not None:
+            self.send_flows()
+            time.sleep(1)
+            self.initiate_test()
+            def check_outcomes(test):
+                if all(self.outcomes.values()):
+                    print "test successful!"
+                else:
+                    for cookie, outcome in self.outcomes.iteritems():
+                        if not outcome:
+                            print "outcome not satisfied: {0}".format(cookie)
+            test_thread = threading.Timer(5, check_outcomes, args=[self.test])
+            test_thread.start()
+
+
+    def match_to_packet(self, match):
+        pkt = packet.Packet()
+        l2 = ethernet.ethernet(
+            dst=match.setdefault('eth_dst', "00:00:00:00:00:02"),
+            src=match.setdefault('eth_src', "00:00:00:00:00:01"),
+            ethertype=match.setdefault('eth_type', 0x800)
+            )
+        pkt.add_protocol(l2)
+        if 'vlan_vid' in match:
+            vl = vlan.vlan(
+                pcp=0,
+                cfi=0,
+                vid=match['vlan_vid'],
+                ethertype=match['eth_type']
+                )
+            pkt.add_protocol(vl)
+        l3 = ipv4.ipv4(
+            src=match.setdefault('ipv4_src', "192.168.1.1"),
+            dst=match.setdefault('ipv4_dst', "192.168.1.2")
+            )
+        pkt.add_protocol(l3)
+        l4 = tcp.tcp(
+            src_port=match.setdefault('tcp_src', 12345),
+            dst_port=match.setdefault('tcp_dst', 80)
+            )
+        pkt.add_protocol(l4)
+
+        pkt.serialize()
+        return pkt
+
+    def initiate_test(self):
+        pkt = self.match_to_packet(self.test['match'])
+        time.sleep(.2)
+
+        print "sending packet:"
+        self.print_packet(pkt)
+        actions = parser.OFPActionOutput(self.test['match'].setdefault('in_port', 1))
+        msg = parser.OFPPacketOut(
+            self.ovs_dp,
+            buffer_id=ofp.OFP_NO_BUFFER,
+            in_port=ofp.OFPP_CONTROLLER,
+            data=pkt.data,
+            actions=[actions]
+            )
+        self.ovs_dp.send_msg(msg)
+
+    def send_flows(self):
+        # send default packet in for ovs
+        mod = parser.OFPFlowMod(
+            datapath=self.ovs_dp,
+            cookie=cookie,
+            priority=low_priority,
+            match=match_all,
+            instructions=[
+                parser.OFPInstructionActions(
+                    ofp.OFPIT_APPLY_ACTIONS,
+                    [action_controller]
+                    )
+                ]
+            )
+        self.ovs_dp.send_msg(mod)
+
         with open('tests.yaml', 'r') as stream:
-            tests = yaml.load_all(stream)
-            for test in tests:
-                if 'group' in test:
-                    buckets = self.create_buckets(dp, test)
+            flows = yaml.load_all(stream)
+            for flow in flows:
+                print flow
+                t = flow['type']
+                if t == 'group' :
+                    buckets = self.create_buckets(self.dut_dp, flow)
                     mod=parser.OFPGroupMod(
-                        datapath=dp,
-                        group_id=test['group'],
-                        type_=group_types[test.setdefault('type', 'all')],
+                        datapath=self.dut_dp,
+                        group_id=flow['id'],
+                        type_=group_types[flow.setdefault('group_type', 'all')],
                         buckets=buckets
                         )
-                    dp.send_msg(mod)
+                    self.dut_dp.send_msg(mod)
                     self.print_mod(mod)
-                else:
-                    match = self.create_match(dp, test)
-                    instructions = self.create_instructions(dp, test)
+                elif t == 'flow':
+                    match = self.create_match(self.dut_dp, flow['match'])
+                    instructions = self.create_instructions(self.dut_dp, flow)
                     mod = parser.OFPFlowMod(
-                        datapath=dp,
+                        datapath=self.dut_dp,
                         cookie=cookie,
                         match=match,
                         instructions=instructions
                         )
-                    dp.send_msg(mod)
+                    self.dut_dp.send_msg(mod)
+                    self.print_mod(mod)
+                elif t == 'test':
+                    self.test = flow
+                elif t == 'outcome':
+                    self.outcomes[flow['cookie']] = False
+                    match = self.create_match(self.ovs_dp, flow['match'])
+                    instructions = parser.OFPInstructionActions(
+                        ofp.OFPIT_APPLY_ACTIONS,
+                        [action_controller]
+                        )
+                    mod = parser.OFPFlowMod(
+                        datapath=self.ovs_dp,
+                        cookie=flow['cookie'],
+                        priority=high_priority,
+                        match=match,
+                        instructions=[instructions]
+                        )
+                    self.ovs_dp.send_msg(mod)
                     self.print_mod(mod)
 
     def create_buckets(self, dp, test):
@@ -177,8 +256,8 @@ class Faucet(app_manager.RyuApp):
                 ))
         return buckets
 
-    def create_match(self, dp, test):
-        return ofctl_v1_3.to_match(dp, test['match'])
+    def create_match(self, dp, match):
+        return ofctl_v1_3.to_match(dp, match)
 
     def create_instructions(self, dp, test):
         # ryu doesnt seem to include instruction parsing
@@ -200,167 +279,16 @@ class Faucet(app_manager.RyuApp):
             # act should be a single entry dict
             for k, v in act.iteritems():
                 if k == 'output':
-                    result.append(parser.OFPActionOutput(int(v)))
+                    if v == 'controller':
+                        result.append(action_controller)
+                    else:
+                        result.append(parser.OFPActionOutput(int(v)))
                 elif k == 'group':
                     result.append(parser.OFPActionGroup(int(v)))
                 elif k == 'push_vlan':
-                    result.append(parser.OFPActionPushVlan(ether.ETH_TYPE_8021Q))
-                    vlan_vid = v | ofproto_v1_3.OFPVID_PRESENT
-                    result.append(parser.OFPActionSetField(vlan_vid=vlan_vid))
+                    #result.append(parser.OFPActionPushVlan(ether.ETH_TYPE_8021Q))
+                    #vlan_vid = v | ofp.OFPVID_PRESENT
+                    result.append(parser.OFPActionSetField(vlan_vid=v))
                 elif k == 'pop_vlan':
                     result.append(parser.OFPActionPopVlan())
         return result
-
-    def delete_all(self, args):
-        print "test delete"
-        mod = parser.OFPFlowMod(
-            datapath=dp,
-            cookie=cookie,
-            command=ofp.OFPFC_DELETE,
-            out_port=ofp.OFPP_ANY,
-            out_group=ofp.OFPG_ANY,
-            match=match_all
-            )
-        dp.send_msg(dp, mod)
-
-    def drop_all(self, args):
-        print "test drop"
-        mod = parser.OFPFlowMod(
-            datapath=dp,
-            cookie=cookie,
-            priority=low_priority,
-            match=match_all,
-            instructions=[]
-            )
-        self.send_flow_mod(dp, mod)
-
-    def apply_output(self, args):
-        print "test apply output"
-        inst = parser.OFPInstructionActions(ofp.OFPIT_APPLY_ACTIONS, [action_2])
-        mod = parser.OFPFlowMod(
-            datapath=dp,
-            cookie=cookie,
-            priority=high_priority,
-            match=match_1,
-            instructions=[inst]
-            )
-        self.send_flow_mod(dp, mod)
-
-    def write_output(self, args):
-        print "test write output"
-        inst = parser.OFPInstructionActions(ofp.OFPIT_WRITE_ACTIONS, [action_2])
-        mod = parser.OFPFlowMod(
-            datapath=dp,
-            cookie=cookie,
-            priority=high_priority,
-            match=match_1,
-            instructions=[inst]
-            )
-        self.send_flow_mod(dp, mod)
-
-    def match_mac(self, args):
-        print "test mac match"
-        mod = parser.OFPFlowMod(
-            datapath=dp,
-            cookie=cookie,
-            priority=highest_priority,
-            match=match_eth_dst,
-            instructions=[]
-            )
-        self.send_flow_mod(dp, mod)
-
-        print "test flow override"
-        mod = parser.OFPFlowMod(
-            datapath=dp,
-            cookie=cookie,
-            priority=highest_priority,
-            match=match_eth_dst,
-            instructions=[inst]
-            )
-        self.send_flow_mod(dp, mod)
-
-
-        print "test multiple outputs"
-        inst = parser.OFPInstructionActions(
-            ofp.OFPIT_APPLY_ACTIONS,
-            [action_2, action_controller]
-            )
-        mod = parser.OFPFlowMod(
-            datapath=dp,
-            cookie=cookie,
-            priority=highest_priority,
-            match=match_eth_dst,
-            instructions=[inst]
-            )
-        self.send_flow_mod(dp, mod)
-
-        print "l2interface group"
-        gid_2 = self.get_group_id(vid, 2)
-        bucket = parser.OFPBucket(
-            watch_port=2,
-            actions=[action_2]
-            )
-        mod = parser.OFPGroupMod(
-            datapath=dp,
-            type_=ofp.OFPGT_INDIRECT,
-            group_id=gid_2,
-            buckets=[bucket]
-            )
-        self.send_group_mod(dp, mod)
-
-        print "now use it"
-        mod = parser.OFPFlowMod(
-            datapath=dp,
-            cookie=cookie,
-            priority=highest_priority,
-            match=match_eth_dst,
-            instructions=[
-                parser.OFPInstructionActions(   ofp.OFPIT_APPLY_ACTIONS,
-                                                [parser.OFPActionGroup(gid_2)]
-                                                )
-                ]
-            )
-        self.send_flow_mod(dp, mod)
-
-        print "l2interface group with vlan"
-        gid_3 = self.get_group_id(vid, 3)
-        actions_push_vlan_3 = [
-            parser.OFPActionPushVlan(ether.ETH_TYPE_8021Q),
-            parser.OFPActionSetField(vlan_vid=vid|ofp.OFPVID_PRESENT),
-            action_3
-            ]
-        bucket = parser.OFPBucket(
-            watch_port=3,
-            actions=actions_push_vlan_3
-            )
-        mod = parser.OFPGroupMod(
-            datapath=dp,
-            type_=ofp.OFPGT_INDIRECT,
-            group_id=gid_3,
-            buckets=[bucket]
-            )
-        self.send_group_mod(dp, mod)
-
-        print "l2flood group"
-        # Make some buckets
-        bucket = parser.OFPBucket(
-            actions=[parser.OFPActionGroup(gid_2)],
-            watch_group=gid_2
-            )
-        flood_buckets = [bucket]
-
-        bucket = parser.OFPBucket(
-            actions=[parser.OFPActionGroup(gid_3)],
-            watch_group=gid_3
-            )
-        flood_buckets.append(bucket)
-
-        # now make the flood group
-        gid = self.get_group_id(vid)
-        mod = parser.OFPGroupMod(
-            datapath=dp,
-            type_=ofp.OFPGT_ALL,
-            group_id=gid,
-            buckets=[bucket]
-            )
-        self.send_group_mod(dp, mod)
