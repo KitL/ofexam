@@ -146,6 +146,7 @@ class SwitchTester(app_manager.RyuApp):
             )
         pkt.add_protocol(l2)
         if 'vlan_vid' in match:
+            pkt.get_protocol(ethernet.ethernet).ethertype=0x8100
             vl = vlan.vlan(
                 pcp=0,
                 cfi=0,
@@ -286,8 +287,8 @@ class SwitchTester(app_manager.RyuApp):
                 elif k == 'group':
                     result.append(parser.OFPActionGroup(int(v)))
                 elif k == 'push_vlan':
-                    #result.append(parser.OFPActionPushVlan(ether.ETH_TYPE_8021Q))
-                    #vlan_vid = v | ofp.OFPVID_PRESENT
+                    result.append(parser.OFPActionPushVlan(ether.ETH_TYPE_8021Q))
+                    vlan_vid = v | ofp.OFPVID_PRESENT
                     result.append(parser.OFPActionSetField(vlan_vid=v))
                 elif k == 'pop_vlan':
                     result.append(parser.OFPActionPopVlan())
